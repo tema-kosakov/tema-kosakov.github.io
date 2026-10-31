@@ -2,13 +2,21 @@
     'use strict';
 
     /**
-     * Плагин автоматической синхронизации меток "Просмотрено" из базы TorrServe Matrix в Lampa.
-     * Срабатывает СРАЗУ при запуске Lampa и при каждом возврате на главный экран.
+     * Плагин автоматической синхронизации просмотров TorrServe -> Lampa
+     * Срабатывает при запуске Lampa и при возврате на главный экран.
      */
     function TorrServeGlobalSyncPlugin() {
-        console.log('TorrServeGlobalSyncPlugin', 'Initialized');
+        // Показ уведомлений на экране ТВ для отладки
+        function showNotice(text) {
+            try {
+                if (window.Lampa && Lampa.Noty) {
+                    Lampa.Noty.show(text);
+                }
+            } catch (e) {}
+            console.log('[TorrServeSync]', text);
+        }
 
-        // Получение URL-адреса TorrServe из настроек Lampa
+        // Формирование URL TorrServe
         function getTorrServeUrl() {
             var ip = Lampa.Storage.field('torrserve_url') || Lampa.Storage.field('torrserve_url_native') || '127.0.0.1:8090';
             if (!/^https?:\/\//i.test(ip)) {
@@ -17,7 +25,7 @@
             return ip.replace(/\/$/, '');
         }
 
-        // Заголовки авторизации (если в TorrServe включен пароль)
+        // Заголовки авторизации
         function getAuthHeader() {
             if (Lampa.Storage.field('torrserve_auth')) {
                 var login = Lampa.Storage.field('torrserve_login') || '';
@@ -27,116 +35,110 @@
             return {};
         }
 
-        /**
-         * Полный процесс синхронизации всех просмотренных торрентов
-         */
         function syncAllTorrents() {
             var serverUrl = getTorrServeUrl();
 
-            // 1. Запрашиваем историю просмотров из TorrServe (/viewed)
+            // Запрашиваем просмотренные из TorrServe
             $.ajax({
                 url: serverUrl + '/viewed',
                 type: 'POST',
                 data: JSON.stringify({ action: 'list' }),
                 contentType: 'application/json',
                 headers: getAuthHeader(),
-                timeout: 3000,
+                timeout: 4000,
                 success: function (viewedItems) {
-                    if (!Array.isArray(viewedItems) || !viewedItems.length) return;
+                    if (!Array.isArray(viewedItems) || !viewedItems.length) {
+                        return;
+                    }
 
-                    // 2. Запрашиваем полный список торрентов из TorrServe (/torrents), чтобы сопоставить hash -> название/карта
+                    // Запрашиваем список торрентов из TorrServe
                     $.ajax({
                         url: serverUrl + '/torrents',
                         type: 'POST',
                         data: JSON.stringify({ action: 'list' }),
                         contentType: 'application/json',
                         headers: getAuthHeader(),
-                        timeout: 3000,
+                        timeout: 4000,
                         success: function (torrentsList) {
-                            if (!Array.isArray(torrentsList)) return;
+                            if (!Array.isArray(torrentsList) || !torrentsList.length) return;
 
                             var onlineView = Lampa.Storage.get('online_view', {}) || {};
-                            var history = Lampa.Storage.get('history', []) || [];
+                            var favoriteHistory = Lampa.Storage.get('favorite', {}) || {};
+                            var historyList = Lampa.Storage.get('history', []) || [];
                             var hasChanges = false;
 
-                            // Создаем картам хэшей быструю карту
+                            // Создаем словарь хэшей
                             var torrentMap = {};
                             torrentsList.forEach(function (t) {
                                 if (t.hash) torrentMap[t.hash.toLowerCase()] = t;
                             });
 
-                            // Проходим по каждому просмотренному объекту в TorrServe
+                            var syncedCount = 0;
+
                             viewedItems.forEach(function (item) {
                                 if (!item.hash) return;
                                 var hashLower = item.hash.toLowerCase();
                                 var torrentInfo = torrentMap[hashLower];
 
                                 if (torrentInfo) {
+                                    syncedCount++;
                                     var fileIndex = item.file_index !== undefined ? item.file_index : 0;
-                                    var cardId = torrentInfo.title || torrentInfo.poster || hashLower;
+                                    var torrentTitle = torrentInfo.title || 'TorrServe Media';
 
-                                    var key = cardId + '_' + fileIndex;
-
-                                    if (!onlineView[key]) {
-                                        onlineView[key] = {
+                                    // 1. Сохраняем в метки времени Lampa
+                                    var timeKey = hashLower + '_' + fileIndex;
+                                    if (!onlineView[timeKey]) {
+                                        onlineView[timeKey] = {
                                             time: 100,
                                             duration: 100,
                                             percent: 100,
-                                            file: fileIndex,
                                             updated: Date.now()
                                         };
                                         hasChanges = true;
                                     }
 
-                                    // Добавляем запись в глобальную историю просмотра Lampa
-                                    var existsInHistory = history.some(function (h) {
-                                        return h.hash === hashLower || h.title === torrentInfo.title;
+                                    // 2. Ищем похожую карточку в истории и отмечаем ее
+                                    var inHistory = historyList.some(function(h) {
+                                        return h.hash === hashLower || (h.title && torrentTitle.indexOf(h.title) !== -1);
                                     });
 
-                                    if (!existsInHistory && torrentInfo.title) {
-                                        history.unshift({
-                                            title: torrentInfo.title,
+                                    if (!inHistory) {
+                                        historyList.unshift({
+                                            id: hashLower,
                                             hash: hashLower,
+                                            title: torrentTitle,
                                             time: Date.now()
                                         });
+                                        hasChanges = true;
                                     }
                                 }
                             });
 
-                            // 3. Сохраняем обновленные данные в локальное хранилище Lampa
                             if (hasChanges) {
                                 Lampa.Storage.set('online_view', onlineView);
-                                Lampa.Storage.set('history', history);
-                                console.log('TorrServeGlobalSyncPlugin', 'Successfully synced viewed torrents!');
+                                Lampa.Storage.set('history', historyList);
+                                showNotice('TorrServe: Синхронизировано ' + syncedCount + ' просмотров');
                             }
                         }
                     });
                 },
                 error: function (err) {
-                    console.log('TorrServeGlobalSyncPlugin', 'TorrServe is offline or unreachable');
+                    console.log('[TorrServeSync] Ошибка подключения к TorrServe:', serverUrl);
                 }
             });
         }
 
-        // --- ТОЧКИ ЗАПУСКА ---
+        // Старт синхронизации
+        setTimeout(syncAllTorrents, 1000);
 
-        // 1. Запуск СРАЗУ при запуске Lampa
-        syncAllTorrents();
-
-        // 2. Повторная синхронизация при возврате на главный экран
+        // При возврате на главный экран
         Lampa.Listener.follow('main', function (e) {
             if (e.type === 'render') {
                 syncAllTorrents();
             }
         });
-
-        // 3. Синхронизация при разворачивании приложения / фокусе
-        window.addEventListener('focus', function () {
-            syncAllTorrents();
-        });
     }
 
-    // Запуск при полной готовности Lampa
     if (window.appready) {
         TorrServeGlobalSyncPlugin();
     } else {
